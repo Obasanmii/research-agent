@@ -3,108 +3,109 @@ import os
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from fpdf import FPDF 
+from fpdf import FPDF
 
-#PAGE CONFIGURATION
+# --- CONFIG ---
 st.set_page_config(page_title="Deep Research Agent", page_icon="🧠", layout="centered")
 
-#SIDEBAR 
-st.sidebar.header("⚙️ Report Settings")
-audience = st.sidebar.selectbox("Target Audience", ["Executive", "Technical", "General Public"])
-focus = st.sidebar.radio("Report Focus", ["Market & Business", "Technology", "Competitor Analysis"])
+# --- STATE MANAGEMENT (MEMORY) ---
+# This checks: "Do we have messages saved? If not, create an empty list."
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-#PDF GENERATION FUNCTION (The Engineer's Fix)
+# --- PDF FUNCTION ---
 def create_pdf(text):
     class PDF(FPDF):
         def header(self):
             self.set_font('Arial', 'B', 12)
             self.cell(0, 10, 'Deep Research Briefing', 0, 1, 'C')
-
         def footer(self):
             self.set_y(-15)
             self.set_font('Arial', 'I', 8)
             self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
-
     pdf = PDF()
     pdf.add_page()
     pdf.set_font("Arial", size=11)
-    
-    # 1. Clean the text (FPDF doesn't like Markdown symbols like ** or ##)
     clean_text = text.replace('*', '').replace('#', '')
-    
-    # 2. Stripping emojis off
     clean_text = clean_text.encode('latin-1', 'replace').decode('latin-1')
-    
     pdf.multi_cell(0, 10, txt=clean_text)
-    return bytes(pdf.output(dest='S'))
+    return bytes(pdf.output(dest='S')) 
 
-#LOGIC
+# --- API SETUP ---
 load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
-
-if not api_key:
-    try:
+try:
+    if "GEMINI_API_KEY" in os.environ:
+        api_key = os.getenv("GEMINI_API_KEY")
+    else:
         api_key = st.secrets["GEMINI_API_KEY"]
-    except:
-        st.error("🔑 API Key Not Found! Check .env or Streamlit Secrets.")
-        st.stop()
+except:
+    st.error("🔑 API Key Not Found!")
+    st.stop()
 
 client = genai.Client(api_key=api_key)
 
-def get_research(query, audience_type, focus_area):
-    sys_instruct = f"""
-    You are a premier AI Research Analyst.
-    Your Target Audience is: {audience_type}.
-    Your Primary Focus is: {focus_area}.
-    Structure the report in Markdown.
-    """
+# --- UI HEADER ---
+st.title("🧠 Deep Research Chat")
+st.caption("Ask follow-up questions. I now remember context.")
+
+# --- 1. DISPLAY HISTORY ---
+# We loop through the saved messages and print them on screen
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# --- 2. HANDLE INPUT ---
+if prompt := st.chat_input("What would you like to research?"):
     
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=query,
-        config=types.GenerateContentConfig(
-            system_instruction=sys_instruct,
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-            response_modalities=["TEXT"], 
-        )
-    )
-    return response
-
-#MAIN UI
-st.title("🧠 Deep Research Agent")
-query = st.text_input("Enter Research Topic:", placeholder="e.g. Nvidia's Strategy")
-
-if st.button("🚀 Generate Briefing", type="primary"):
-    if not query:
-        st.warning("Please enter a topic.")
-    else:
-        with st.spinner("Analyzing..."):
+    # A. Display User Message immediately
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    # Save it to history
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    
+    # B. Generate Response
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
             try:
-                result = get_research(query, audience, focus)
-                st.markdown("---")
-                st.markdown(result.text)
+                # We construct a "Context String" from previous messages
+                # This is the "Memory" trick: We feed the history back into the prompt.
+                history_text = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.messages[-4:]])
                 
-                #DOWNLOAD SECTION
-                col1, col2 = st.columns(2)
+                full_prompt = f"""
+                HISTORY OF CONVERSATION:
+                {history_text}
                 
-                with col1:
-                    # Original Markdown Download
-                    st.download_button(
-                        label="💾 Download Markdown",
-                        data=result.text,
-                        file_name="report.md",
-                        mime="text/markdown"
+                NEW USER QUERY:
+                {prompt}
+                
+                SYSTEM INSTRUCTION:
+                You are a Research Analyst. Use the history to understand context.
+                If the user asks a follow-up (e.g., "Why?"), refer to the previous info.
+                Always use Google Search for the NEW query.
+                """
+                
+                response = client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=full_prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[types.Tool(google_search=types.GoogleSearch())],
+                        response_modalities=["TEXT"], 
                     )
+                )
                 
-                with col2:
-                    # New PDF Download
-                    pdf_data = create_pdf(result.text)
-                    st.download_button(
-                        label="📄 Download PDF",
-                        data=pdf_data,
-                        file_name="report.pdf",
-                        mime="application/pdf"
-                    )
+                # Display AI Response
+                st.markdown(response.text)
+                
+                # Show Sources if available
+                if response.candidates[0].grounding_metadata.search_entry_point:
+                     st.components.v1.html(response.candidates[0].grounding_metadata.search_entry_point.rendered_content, height=200, scrolling=True)
+                
+                # Save AI Response to history
+                st.session_state.messages.append({"role": "assistant", "content": response.text})
+                
+                # PDF Download (Optional: Only for the latest answer)
+                pdf_data = create_pdf(response.text)
+                st.download_button("📄 Download PDF", data=pdf_data, file_name="briefing.pdf", mime="application/pdf")
                 
             except Exception as e:
-                st.error(f"An error occurred: {e}")
+                st.error(f"Error: {e}")
